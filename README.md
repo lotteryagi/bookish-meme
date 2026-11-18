@@ -78,3 +78,10 @@ eşlemesi · `results_done.txt` skoru alınan maçlar. Elle düzenlemeyin.
 ## Ayarlar (workflow içindeki `env`)
 `MARKETS` (geçmişsiz), `HISTORY_MARKETS` (geçmişli), `PERIODS`, `WINDOW_HOURS`,
 `BACKUP_MINUTES`, `LEAGUES`, `OH_CONCURRENCY`, `OH_TIMEZONE` vb.
+
+## Tahmin ve geriye dönük test
+- `python scripts/predict.py match data/<gün>/<lig>/<maç>.json` — oranlardan skor
+  olasılıkları (Dixon-Coles); `coupon` ile iki maçlık kupon. Kupon görevleri bunu kullanır.
+- **Geriye dönük test:** Actions → "Geriye dönük test" → Run workflow (sezon/lig seçilebilir).
+  Geçmiş maçların kapanış oranları + skorları çekilir, `backtest/RAPOR.md` yazılır.
+  Hafta sonu oran çekimiyle aynı proxy'yi kullandığı için Cuma–Pazar dışında çalıştırın.

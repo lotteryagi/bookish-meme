@@ -19,6 +19,8 @@ oturumlarda).
 | `kupon-planlari/` | Kuponun hangi saatlerde hazırlanacağı | Claude |
 | `kuponlar/<gün>.md` | Hazırlanan kuponlar + Pazartesi değerlendirmesi | Claude |
 | `scripts/planner.py`, `.github/workflows/weekend-odds.yml` | Toplama sistemi | — |
+| `scripts/predict.py` | Oranlardan skor olasılıkları (kupon hesabı) | — |
+| `scripts/backtest.py`, `.github/workflows/backtest.yml`, `backtest/` | Geçmiş sezonlarla test + `RAPOR.md` | bot (elle tetiklenir) |
 
 - `state/` ve workflow'daki `MAÇ SLOTLARI` bloğunu **elle düzenleme**; bot yönetir.
 - Bot sık commit atar: commit'ten önce her zaman `git pull --rebase`.
@@ -52,27 +54,36 @@ Tam anahtar adlarından emin değilsen önce bir dosyayı açıp yapıya bak; va
 
 1. `git pull --rebase`. `state/plan.json`'dan istenen saatteki maçları bul. `data/`'da
    dosyası **olmayan** maçı (henüz çekilmemiş) söyle ve dışarıda bırak.
-2. **İki tahmin** hazırla; ikisi de **kod çalıştırılarak** hesaplanır, skor asla
-   oranlara bakıp uydurulmaz.
+2. **İki tahmin** hazırla. Hesap **her zaman `scripts/predict.py` ile** yapılır; modeli
+   yeniden yazma, skoru oranlara bakıp uydurma. Betik hata verirse düzeltip testle,
+   sonra kullan.
 
 ### A) Model tahmini (saf hesap)
-1. **Marjı ayıkla:** Pinnacle varsa onun oranları, yoksa bookmaker'ların medyanı.
-   Her marketin olasılıklarını normalize et (toplam = 1).
-2. **Beklenen goller:** Ev (λ_ev) ve deplasman (λ_dep) gol beklentisini, modelin verdiği
-   olasılıkların piyasa olasılıklarına en iyi uyacağı şekilde bul (en küçük kareler):
-   1X2 + en dengeli 2–3 Alt/Üst baremi + en dengeli 1–2 Asya baremi.
-3. **Skor matrisi:** Dixon-Coles (bağımsız Poisson + düşük skor düzeltmesi, ρ ≈ −0,05),
-   0–6 gol. 1. yarı için aynı işlemi `1st_half` oranlarıyla yap.
-4. **Kontrol:** Matrisin toplamı ~1; modelin 1X2 ve 2.5 Üst olasılıkları piyasadakine
-   birkaç puan içinde olmalı. Değilse hesapta hata vardır, düzeltmeden sunma.
+```bash
+python scripts/predict.py match data/<gün>/<lig>/<maç>.json --json /tmp/p_<maç>.json
+```
+Betik: marjı ayıklar (Pinnacle, yoksa medyan), 1X2 + Alt/Üst + Asya baremlerine en iyi uyan
+λ_ev / λ_dep'i bulur, Dixon-Coles (ρ = −0,05) skor matrisini çıkarır; maç sonu ve ilk yarı.
+Çıktıdaki **kontrol** `UYARI` ise (model piyasadan >3 puan sapıyor) o maçı kupona koyma ve
+nedenini yaz. Ayarların gerekçesi: `backtest/RAPOR.md` (geçmiş sezonlarla test).
 
 ### B) Model + yorum
 - Web'de güncel haber ara: açıklanan ilk 11'ler, sakat/cezalı, rotasyon (yakında Avrupa
   maçı), motivasyon (küme düşme, hedefsizlik), derbi, hava/saha.
 - Sadece **somut bir bilgi** varsa λ'ları düzelt; her düzeltmeyi **gerekçesi ve büyüklüğüyle**
-  yaz (ör. "Kane kadroda yok: λ_ev 1,90 → 1,70"). Bilgi yoksa B = A; düzeltme uydurma.
+  yaz. Bilgi yoksa B = A; düzeltme uydurma. Düzeltme betiğe verilir:
+  ```bash
+  python scripts/predict.py match <dosya> --delta-home -0.20 --note "Kane kadroda yok" --json /tmp/p_<maç>.json
+  ```
 - Düzeltmeler küçük tutulur (genelde λ başına ±0,25'ten az). Piyasa çoğu bilgiyi zaten
   fiyatlar; kadro haberi oranlar alındıktan sonra çıktıysa en değerli düzeltme budur.
+
+### Kupon seçimi
+```bash
+python scripts/predict.py coupon /tmp/p_*.json            # B'ye göre (varsayılan)
+python scripts/predict.py coupon /tmp/p_*.json --use A    # karşılaştırma için
+```
+Kontrolü geçen maçlardan, en olası skorlarının birlikte tutma ihtimali en yüksek ikiliyi seçer.
 
 ### Sunum
 Her maç için: λ'lar, en olası 5 skor (%), MS 1/X/2, 2.5 Üst, KG Var; A ve B yan yana.
@@ -90,5 +101,6 @@ girmez.)
 ## Pazartesi değerlendirme (kullanıcı isterse)
 `results/` geldikten sonra o haftanın `kuponlar/` kayıtlarını sonuçlarla karşılaştır ve
 aynı dosyaya ekle: kupon tuttu mu, gerçekleşen skora A'nın ve B'nin verdiği olasılık,
-log-loss (A vs B). Haftalar biriktikçe B'nin A'yı gerçekten geçip geçmediğini özetle;
+log-loss (A vs B). Olasılıklar kuponla birlikte kaydedilen değerlerden alınır (sonradan
+yeniden hesaplanmaz). Haftalar biriktikçe B'nin A'yı gerçekten geçip geçmediğini özetle;
 geçmiyorsa kullanıcıya yorum katmayı bırakmayı öner.

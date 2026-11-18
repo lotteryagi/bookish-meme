@@ -1,0 +1,145 @@
+name: Geriye dönük test (geçmiş sezonlar)
+
+# Elle çalıştırılır: Actions → "Geriye dönük test" → Run workflow.
+# Her lig × sezon ayrı job'da çekilir (en fazla 2 job aynı anda; proxy'yi yormamak için),
+# sonra backtest/data/*.jsonl ve backtest/RAPOR.md repoya yazılır.
+# Hafta sonu oran çekimiyle aynı proxy'yi kullanır: Cuma–Pazar dışında çalıştırın.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Sezonlar (virgülle), ör. 2025-2026,2024-2025"
+        default: "2025-2026"
+      leagues:
+        description: "Ligler (virgülle)"
+        default: "england-premier-league,spain-laliga,italy-serie-a,germany-bundesliga"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: backtest
+  cancel-in-progress: false
+
+env:
+  ODDSHARVESTER_VERSION: "0.20.0"
+  # Sadece maç sonu; modelin kullandığı baremler (çeyrekler hariç). Her barem bir sayfa tıklaması.
+  MARKETS: >-
+    1x2,over_under_1_5,over_under_2_5,over_under_3_5,
+    asian_handicap_-2,asian_handicap_-1_5,asian_handicap_-1,asian_handicap_-0_5,
+    asian_handicap_0,asian_handicap_+0_5,asian_handicap_+1,asian_handicap_+1_5
+  OH_PROXY_URL: ${{ secrets.PROXY_URL }}
+  OH_PROXY_USER: ${{ secrets.PROXY_USER }}
+  OH_PROXY_PASS: ${{ secrets.PROXY_PASS }}
+  OH_HEADLESS: "true"
+  OH_TIMEZONE: Europe/Istanbul
+  OH_CONCURRENCY: "2"
+  OH_REQUEST_DELAY: "2"
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      combos: ${{ steps.m.outputs.combos }}
+    steps:
+      - id: m
+        env:
+          SEASONS: ${{ inputs.seasons }}
+          LEAGUES: ${{ inputs.leagues }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          s = [x.strip() for x in os.environ["SEASONS"].split(",") if x.strip()]
+          l = [x.strip() for x in os.environ["LEAGUES"].split(",") if x.strip()]
+          print("combos=" + json.dumps([{"league": a, "season": b} for b in s for a in l]))
+          EOF
+
+  scrape:
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.combos) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-oh-${{ env.ODDSHARVESTER_VERSION }}
+
+      - name: OddsHarvester kurulumu
+        run: |
+          pip install "oddsharvester==${ODDSHARVESTER_VERSION}"
+          python -m playwright install --with-deps chromium
+
+      - name: ${{ matrix.league }} ${{ matrix.season }} çek
+        run: |
+          mkdir -p work
+          MARKETS_CLEAN=$(echo "$MARKETS" | tr -d ' \n')
+          # Maçlar geldikçe satır satır yazılır; süre dolarsa o ana kadar çekilenler kalır.
+          timeout 320m oddsharvester historic -s football \
+            -l "${{ matrix.league }}" --season "${{ matrix.season }}" \
+            -m "$MARKETS_CLEAN" --period full_time --bookies-filter all \
+            --stream-ndjson > work/raw.ndjson \
+            || echo "::warning::Çekim tam bitmedi (süre/hata); alınan kısım kullanılacak"
+          echo "Satır: $(wc -l < work/raw.ndjson)"
+
+      - name: Küçült
+        run: |
+          python scripts/predict.py reduce work/raw.ndjson \
+            "out/${{ matrix.league }}_${{ matrix.season }}.jsonl" \
+            --league "${{ matrix.league }}" --season "${{ matrix.season }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bt-${{ matrix.league }}-${{ matrix.season }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: scrape
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bt-*
+          path: backtest/data
+          merge-multiple: true
+
+      - name: Rapor
+        run: |
+          ls -la backtest/data || true
+          python scripts/backtest.py backtest/data -o backtest/RAPOR.md
+
+      - name: Repoya kaydet
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add backtest
+          if git diff --cached --quiet; then echo "Değişiklik yok"; exit 0; fi
+          git commit -m "backtest: $(date -u +'%Y-%m-%d %H:%M') UTC"
+          for n in 1 2 3 4 5; do
+            git pull --rebase && git push && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep 10
+          done
+          exit 1
