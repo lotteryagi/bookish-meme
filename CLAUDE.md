@@ -4,6 +4,10 @@ Bu repo, hafta sonu (Cuma–Pazar, TR saati) Premier League, La Liga, Serie A ve
 maçlarının oranlarını OddsPortal'dan GitHub Actions ile otomatik toplar. Kullanıcı Türkçe
 konuşur; cevaplar Türkçe olmalı.
 
+**Her oturumun başında `HATIRLATMALAR.md`'ye bak:** tarihi gelmiş açık madde varsa
+kullanıcıya hatırlat (zamanlanmış bulut görevlerinde değil, kullanıcıyla konuşulan
+oturumlarda).
+
 ## Repo düzeni
 
 | Yol | İçerik | Kim yazar |
