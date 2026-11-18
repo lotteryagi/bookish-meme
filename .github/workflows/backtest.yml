@@ -14,6 +14,12 @@ on:
       leagues:
         description: "Ligler (virgülle)"
         default: "england-premier-league,spain-laliga,italy-serie-a,germany-bundesliga"
+      max_pages:
+        description: "Lig başına en fazla kaç sonuç sayfası (1 sayfa ≈ en yeni 50 maç); boş = hepsi"
+        default: ""
+      since_days:
+        description: "Sadece son N günün maçları (ör. 30); boş = hepsi"
+        default: ""
 
 permissions:
   contents: write
@@ -82,22 +88,30 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: ${{ matrix.league }} ${{ matrix.season }} çek
+        env:
+          MAX_PAGES: ${{ inputs.max_pages }}
         run: |
           mkdir -p work
           MARKETS_CLEAN=$(echo "$MARKETS" | tr -d ' \n')
+          PAGES_ARG=""
+          if [ -n "$MAX_PAGES" ]; then PAGES_ARG="--max-pages $MAX_PAGES"; fi
           # Maçlar geldikçe satır satır yazılır; süre dolarsa o ana kadar çekilenler kalır.
           timeout 320m oddsharvester historic -s football \
-            -l "${{ matrix.league }}" --season "${{ matrix.season }}" \
+            -l "${{ matrix.league }}" --season "${{ matrix.season }}" $PAGES_ARG \
             -m "$MARKETS_CLEAN" --period full_time --bookies-filter all \
             --stream-ndjson > work/raw.ndjson \
             || echo "::warning::Çekim tam bitmedi (süre/hata); alınan kısım kullanılacak"
           echo "Satır: $(wc -l < work/raw.ndjson)"
 
       - name: Küçült
+        env:
+          SINCE_DAYS: ${{ inputs.since_days }}
         run: |
+          SINCE_ARG=""
+          if [ -n "$SINCE_DAYS" ]; then SINCE_ARG="--since $(date -u -d "-${SINCE_DAYS} days" +%Y-%m-%d)"; fi
           python scripts/predict.py reduce work/raw.ndjson \
             "out/${{ matrix.league }}_${{ matrix.season }}.jsonl" \
-            --league "${{ matrix.league }}" --season "${{ matrix.season }}"
+            --league "${{ matrix.league }}" --season "${{ matrix.season }}" $SINCE_ARG
 
       - uses: actions/upload-artifact@v4
         with:

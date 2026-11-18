@@ -446,6 +446,8 @@ def cmd_reduce(args) -> None:
             hs, as_ = int(rec.get("home_score")), int(rec.get("away_score"))
         except (TypeError, ValueError):
             continue
+        if args.since and (rec.get("match_date") or "")[:10] < args.since:
+            continue
         summary = summarize_odds(rec)
         if not summary.get("1x2"):
             continue
@@ -496,6 +498,7 @@ def main() -> None:
     r.add_argument("out")
     r.add_argument("--league", required=True)
     r.add_argument("--season", required=True)
+    r.add_argument("--since", help="sadece bu tarihten (YYYY-MM-DD) itibaren oynanan maçlar")
     r.set_defaults(func=cmd_reduce)
 
     args = p.parse_args()
