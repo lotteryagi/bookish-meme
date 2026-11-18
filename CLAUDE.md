@@ -104,3 +104,14 @@ aynı dosyaya ekle: kupon tuttu mu, gerçekleşen skora A'nın ve B'nin verdiği
 log-loss (A vs B). Olasılıklar kuponla birlikte kaydedilen değerlerden alınır (sonradan
 yeniden hesaplanmaz). Haftalar biriktikçe B'nin A'yı gerçekten geçip geçmediğini özetle;
 geçmiyorsa kullanıcıya yorum katmayı bırakmayı öner.
+
+## Kör test (Claude'un kendi bilgisi, geçmiş maçlar)
+Sadece Claude'un bilgi kesim tarihinden (Haziran 2026) **sonra** oynanan maçlarda geçerlidir.
+Web araması **yok**; `backtest/data/*.jsonl` dosyaları skor içerdiği için **okunmaz**.
+1. `python scripts/backtest.py --blind backtest/kor/liste.csv` → oranları görmeden her maç
+   için λ_ev, λ_dep yaz: `backtest/kor/C.csv` (`match_link,lambda_home,lambda_away,gerekce`).
+   **Commit + push.**
+2. `python scripts/backtest.py --blind backtest/kor/liste_A.csv --with-a` → A'yı görerek
+   kendi bilginle düzeltme: `backtest/kor/B.csv` (`match_link,delta_home,delta_away,gerekce`;
+   bilgi yoksa 0). **Commit + push.**
+3. Ancak sonra `python scripts/backtest.py` → `RAPOR.md` A/B/C karşılaştırması. Commit + push.

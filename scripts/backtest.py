@@ -10,8 +10,10 @@ Kullanım: python scripts/backtest.py [backtest/data] [-o backtest/RAPOR.md]
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import statistics
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -189,14 +191,136 @@ def report(matches: list[dict], results: list[dict]) -> str:
     return "\n".join(out)
 
 
+# ------------------------------------------------- Claude'un kör tahminleri (B ve C)
+#
+# C.csv: match_link,lambda_home,lambda_away,gerekce  -> oranları görmeden, sadece kendi bilgisiyle
+# B.csv: match_link,delta_home,delta_away,gerekce    -> A'nın λ'larına kendi bilgisiyle düzeltme
+# İkisi de skorlar görülmeden yazılır (--blind çıktısında skor yoktur) ve önce commit edilir.
+
+
+def export_blind(matches: list[dict], out: Path, with_a: bool) -> None:
+    """Skorları İÇERMEYEN maç listesi; with_a ise A modelinin λ ve olasılıkları da eklenir."""
+    cols = ["match_link", "league", "date", "home", "away"]
+    if with_a:
+        cols += ["lambda_home_A", "lambda_away_A", "p_home_A", "p_draw_A", "p_away_A", "p_over_2_5_A"]
+    rows = []
+    for r in sorted(matches, key=lambda x: (x["league"], x.get("match_date") or "")):
+        row = {
+            "match_link": r["match_link"],
+            "league": r["league"],
+            "date": (r.get("match_date") or "")[:16],
+            "home": r.get("home"),
+            "away": r.get("away"),
+        }
+        if with_a:
+            fit = P.fit_lambdas(r["odds"], "auto", P.DEFAULT_RHO)
+            if fit is None:
+                continue
+            d = P.describe(fit["lambda_home"], fit["lambda_away"], P.DEFAULT_RHO)
+            row.update(
+                lambda_home_A=d["lambda_home"], lambda_away_A=d["lambda_away"], p_home_A=d["p_home"],
+                p_draw_A=d["p_draw"], p_away_A=d["p_away"], p_over_2_5_A=d["p_over_2_5"],
+            )
+        rows.append(row)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"{len(rows)} maç (skorsuz) -> {out}")
+
+
+def _read_csv(path: Path) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    with path.open(newline="", encoding="utf-8") as fh:
+        return {r["match_link"]: r for r in csv.DictReader(fh) if r.get("match_link")}
+
+
+def _score_metrics(m, score) -> tuple[float, bool, float]:
+    hs, as_ = score
+    p = m[hs][as_] if hs <= P.MAX_GOALS and as_ <= P.MAX_GOALS else EPS
+    best = max(((q, i, j) for i, row in enumerate(m) for j, q in enumerate(row)))
+    h, d, a = P.p_1x2(m)
+    res = 0 if hs > as_ else 1 if hs == as_ else 2
+    return -math.log(max(p, EPS)), (best[1], best[2]) == (hs, as_), -math.log(max((h, d, a)[res], EPS))
+
+
+def claude_section(matches: list[dict], kor_dir: Path) -> list[str]:
+    c_rows, b_rows = _read_csv(kor_dir / "C.csv"), _read_csv(kor_dir / "B.csv")
+    if not c_rows and not b_rows:
+        return []
+    rho = P.DEFAULT_RHO
+    stats = {k: {"ll": [], "hit": [], "ll1x2": []} for k in ("A", "B", "C")}
+    diffs = {"B": [], "C": []}
+    for r in matches:
+        link = r["match_link"]
+        if link not in c_rows and link not in b_rows:
+            continue
+        fit = P.fit_lambdas(r["odds"], "auto", rho)
+        if fit is None:
+            continue
+        lh, la = fit["lambda_home"], fit["lambda_away"]
+        res = {"A": _score_metrics(P.score_matrix(lh, la, rho), r["score"])}
+        if link in b_rows:
+            b = b_rows[link]
+            dh, da = float(b.get("delta_home") or 0), float(b.get("delta_away") or 0)
+            res["B"] = _score_metrics(P.score_matrix(max(lh + dh, 0.05), max(la + da, 0.05), rho), r["score"])
+        if link in c_rows:
+            c = c_rows[link]
+            res["C"] = _score_metrics(
+                P.score_matrix(float(c["lambda_home"]), float(c["lambda_away"]), rho), r["score"]
+            )
+        if "B" in res and "C" in res:  # üçü de olan maçlar üzerinden adil karşılaştırma
+            for k, (ll, hit, ll1) in res.items():
+                stats[k]["ll"].append(ll)
+                stats[k]["hit"].append(hit)
+                stats[k]["ll1x2"].append(ll1)
+            diffs["B"].append(res["B"][0] - res["A"][0])
+            diffs["C"].append(res["C"][0] - res["A"][0])
+    n = len(stats["A"]["ll"])
+    out = ["", "## Claude'un kör tahminleri (web yok, sonuçlar görülmeden)", ""]
+    if not n:
+        return out + ["B.csv ve C.csv'de ortak maç yok."]
+    out += [
+        f"{n} maç. A = sadece oranlar · B = oranlar + Claude'un bilgisi · C = sadece Claude'un bilgisi (oransız).",
+        "",
+        "| Tahmin | Skor log-loss ↓ | En olası skor tuttu | 1X2 log-loss ↓ |",
+        "|---|---|---|---|",
+    ]
+    for k in ("A", "B", "C"):
+        s = stats[k]
+        out.append(
+            f"| {k} | {sum(s['ll']) / n:.4f} | {pct(sum(s['hit']) / n)} | {sum(s['ll1x2']) / n:.4f} |"
+        )
+    out.append("")
+    for k in ("B", "C"):
+        d = diffs[k]
+        mean = sum(d) / n
+        se = statistics.stdev(d) / math.sqrt(n) if n > 1 else float("nan")
+        verdict = (
+            "A'dan anlamlı şekilde **daha iyi**" if mean + 2 * se < 0
+            else "A'dan anlamlı şekilde **daha kötü**" if mean - 2 * se > 0
+            else "A'dan farkı **şanstan ayırt edilemiyor**"
+        )
+        out.append(f"- {k} − A log-loss farkı: {mean:+.4f} (±{2 * se:.4f}, %95) → {verdict}.")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("data_dir", nargs="?", default="backtest/data")
     ap.add_argument("-o", "--out", default="backtest/RAPOR.md")
+    ap.add_argument("--blind", metavar="CSV", help="skorsuz maç listesini yaz ve çık")
+    ap.add_argument("--with-a", action="store_true", help="--blind listesine A modelinin λ'larını ekle")
+    ap.add_argument("--kor-dir", default="backtest/kor", help="Claude'un B.csv / C.csv dosyaları")
     args = ap.parse_args()
     matches = load(Path(args.data_dir))
     if not matches:
         sys.exit(f"{args.data_dir} içinde veri yok")
+    if args.blind:
+        export_blind(matches, Path(args.blind), args.with_a)
+        return
     results = []
     for source in SOURCES:
         for rho in RHOS:
@@ -207,7 +331,8 @@ def main() -> None:
             if s.get("n"):
                 print(f"{source:8} ρ={rho:+.2f}: n={s['n']} log-loss={s['ll_score']:.4f} tuttu={pct(s['top_hit'])}")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(report(matches, results), encoding="utf-8")
+    text = report(matches, results) + "\n".join(claude_section(matches, Path(args.kor_dir))) + "\n"
+    Path(args.out).write_text(text, encoding="utf-8")
     print(f"Rapor: {args.out}")
 
 
