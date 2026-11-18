@@ -1,0 +1,222 @@
+name: Hafta sonu oranları (OddsHarvester)
+
+on:
+  schedule:
+    # GitHub cron UTC'dir. Türkiye = UTC+3.
+    # Haftalık liste: Perşembe 09:00 TR. Bu satırı değiştirirsen "Yapılacak iş var mı?" adımındaki '0 6 * * 4' karşılaştırmasını da değiştir.
+    - cron: "0 6 * * 4"
+    # Haftalık sonuçlar: Pazartesi 09:00 TR. Değiştirirsen aşağıdaki '0 6 * * 1' karşılaştırmasını da değiştir.
+    - cron: "0 6 * * 1"
+    # Aşağıdaki satırları Perşembe çalışması o haftanın maç saatlerine göre otomatik yazar
+    # (maçtan WINDOW_HOURS önce + BACKUP_MINUTES sonra bir yedek).
+    # >>> MAÇ SLOTLARI (planner.py schedule yazar, elle düzenlemeyin)
+    # <<< MAÇ SLOTLARI
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Gün kontrolünü atla (test için)"
+        type: boolean
+        default: false
+      force_plan:
+        description: "Listeyi ve maç saatlerini şimdi yeniden çıkar"
+        type: boolean
+        default: false
+      results:
+        description: "Bitmiş maçların skorlarını şimdi çek"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekend-odds
+  cancel-in-progress: false
+
+env:
+  TZ_NAME: Europe/Istanbul
+  WINDOW_HOURS: "2"            # maç başlamadan kaç saat önce
+  BACKUP_MINUTES: "45"         # her slot için atlanmaya karşı yedek çalışma (0 = kapalı)
+  ALLOWED_WEEKDAYS: "4,5,6"    # Cuma, Cumartesi, Pazar
+  LEAGUES: england-premier-league,champions-league,spain-laliga,italy-serie-a,germany-bundesliga
+  # Skor tahmini için hafif ayar.
+  # 1. geçiş: bu marketler, oran geçmişi OLMADAN (over_under / asian_handicap şemsiye token:
+  # sayfada görünen tüm baremlere genişler). Tüm bookmaker'ların güncel oranları.
+  MARKETS: 1x2,btts,over_under,asian_handicap
+  # 2. geçiş: sadece bu marketler, oran geçmişi (açılış + hareketler) İLE.
+  HISTORY_MARKETS: 1x2,over_under_2_5
+  PERIODS: full_time 1st_half
+  ODDSHARVESTER_VERSION: "0.20.0"
+  # Proxy ayarları secret'lardan; OddsHarvester bunları doğrudan okur.
+  # PROXY_URL: boşlukla ayrılmış birden fazla proxy olabilir (http://user:pass@host:port)
+  OH_PROXY_URL: ${{ secrets.PROXY_URL }}
+  OH_PROXY_USER: ${{ secrets.PROXY_USER }}
+  OH_PROXY_PASS: ${{ secrets.PROXY_PASS }}
+  OH_HEADLESS: "true"
+  OH_TIMEZONE: Europe/Istanbul
+  OH_CONCURRENCY: "3"
+  OH_REQUEST_DELAY: "1.5"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Kuyrukta bekleyen çalışma, tetiklendiği andaki eski commit'i değil,
+          # başladığı andaki en güncel hali almalı (yoksa scraped.txt eski kalır).
+          ref: ${{ github.ref_name }}
+          # Workflow dosyasını (cron satırlarını) push edebilmek için workflow yetkili token gerekir.
+          # GITHUB_TOKEN .github/workflows altındaki dosyaları değiştiremez.
+          token: ${{ secrets.WORKFLOW_PAT || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Yapılacak iş var mı?
+        id: check
+        run: |
+          python scripts/planner.py check \
+            ${{ inputs.force && '--force' || '' }} \
+            ${{ (inputs.force_plan || github.event.schedule == '0 6 * * 4') && '--plan' || '' }} \
+            ${{ (inputs.results || github.event.schedule == '0 6 * * 1') && '--results' || '' }}
+
+      - name: WORKFLOW_PAT kontrolü
+        if: steps.check.outputs.need_plan == 'true'
+        env:
+          HAS_PAT: ${{ secrets.WORKFLOW_PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::error::WORKFLOW_PAT secret'ı yok; maç saatleri cron'a yazılamaz (README > Kurulum)"
+            exit 1
+          fi
+
+      # ---- Buradan sonrası sadece plan yenilenecekse ya da zamanı gelen maç varsa çalışır ----
+
+      - name: Playwright önbelleği
+        if: steps.check.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-oh-${{ env.ODDSHARVESTER_VERSION }}
+
+      - name: OddsHarvester kurulumu
+        if: steps.check.outputs.run == 'true'
+        run: |
+          pip install "oddsharvester==${ODDSHARVESTER_VERSION}"
+          python -m playwright install --with-deps chromium
+
+      - name: Proxy secret kontrolü
+        if: steps.check.outputs.run == 'true'
+        run: |
+          if [ -z "$OH_PROXY_URL" ]; then
+            echo "::error::PROXY_URL secret'ı tanımlı değil (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+      - name: Fikstürü yenile (sadece linkler + başlama saati)
+        if: steps.check.outputs.need_plan == 'true'
+        run: |
+          mkdir -p work
+          # Boş listede OddsHarvester exit 1 döner; bu normal, plan eski haliyle korunur.
+          oddsharvester upcoming -s football -l "$LEAGUES" \
+            --links-only -f csv -o work/links.csv || echo "::warning::Link listesi alınamadı/boş"
+          python scripts/planner.py update-plan work/links.csv
+          python scripts/planner.py schedule .github/workflows/weekend-odds.yml
+
+      - name: Zamanı gelen maçlar
+        id: due
+        if: steps.check.outputs.run == 'true' && steps.check.outputs.results != 'true'
+        run: python scripts/planner.py due work/to_scrape.txt
+
+      - name: Oranları çek (1. geçiş tüm marketler geçmişsiz, 2. geçiş seçili marketler geçmişli)
+        if: steps.due.outputs.due_count != '' && steps.due.outputs.due_count != '0'
+        run: |
+          for PERIOD in $PERIODS; do
+            echo "::group::$PERIOD - güncel oranlar"
+            oddsharvester upcoming -s football \
+              --match-links-file work/to_scrape.txt \
+              -m "$MARKETS" \
+              --period "$PERIOD" \
+              --local-kickoff \
+              --bookies-filter all \
+              -f json -o "work/odds_${PERIOD}.json" \
+              || echo "::warning::$PERIOD güncel oranlarda hata (alınan kısım yine kaydedilir)"
+            echo "::endgroup::"
+          done
+          for PERIOD in $PERIODS; do
+            echo "::group::$PERIOD - oran geçmişi"
+            oddsharvester upcoming -s football \
+              --match-links-file work/to_scrape.txt \
+              -m "$HISTORY_MARKETS" \
+              --period "$PERIOD" \
+              --odds-history \
+              --bookies-filter all \
+              -f json -o "work/hist_${PERIOD}.json" \
+              || echo "::warning::$PERIOD oran geçmişinde hata (alınan kısım yine kaydedilir)"
+            echo "::endgroup::"
+          done
+
+      - name: Topluluk oylarını çek
+        if: steps.due.outputs.due_count != '' && steps.due.outputs.due_count != '0'
+        continue-on-error: true
+        run: |
+          mkdir -p work/community
+          i=0
+          while read -r LINK; do
+            i=$((i+1))
+            oddsharvester community --match-url "$LINK" -f json -o "work/community/${i}.json" \
+              || echo "::warning::Topluluk oyu yok: $LINK"
+          done < work/to_scrape.txt
+
+      - name: Tek dosyada birleştir
+        if: steps.due.outputs.due_count != '' && steps.due.outputs.due_count != '0'
+        run: python scripts/planner.py merge work/to_scrape.txt work
+
+      # ---- Pazartesi: bitmiş maçların skorları ----
+
+      - name: Sonucu alınacak maçlar
+        id: rdue
+        if: steps.check.outputs.results == 'true'
+        run: python scripts/planner.py results-due work/results_links.txt
+
+      - name: Skorları çek (maç sayfası + kapanış 1X2)
+        if: steps.rdue.outputs.results_count != '' && steps.rdue.outputs.results_count != '0'
+        run: |
+          oddsharvester historic -s football \
+            --match-links-file work/results_links.txt \
+            -m 1x2 \
+            --local-kickoff \
+            --bookies-filter all \
+            -f json -o work/results.json \
+            || echo "::warning::Bazı skorlar alınamadı (alınan kısım yine kaydedilir)"
+          python scripts/planner.py merge-results work/results.json
+
+      - name: Ham çıktıları artifact olarak sakla
+        if: always() && steps.check.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ github.run_id }}
+          path: work/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Repoya kaydet
+        if: steps.check.outputs.run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          mkdir -p results
+          git add state data results .github/workflows/weekend-odds.yml
+          if git diff --cached --quiet; then
+            echo "Değişiklik yok"; exit 0
+          fi
+          git commit -m "odds: $(date -u +'%Y-%m-%d %H:%M') UTC"
+          for n in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          exit 1
